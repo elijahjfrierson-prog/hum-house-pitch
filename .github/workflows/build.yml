@@ -1,0 +1,223 @@
+name: Build plugin artifacts
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: write  # needed for softprops/action-gh-release to attach assets
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS (VST3 + AU, universal .pkg)
+            os: macos-14
+            artifact: HumHouse-Pitch-Shifter-macOS
+          - name: Windows (VST3 + installer)
+            os: windows-2022
+            artifact: HumHouse-Pitch-Shifter-Windows-x64
+          - name: Linux (VST3)
+            os: ubuntu-22.04
+            artifact: HumHouse-Pitch-Shifter-Linux-x86_64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev libx11-dev libxrandr-dev libxinerama-dev \
+            libxcursor-dev libfreetype6-dev libfontconfig1-dev \
+            libgl1-mesa-dev libxrender-dev libxcomposite-dev libxext-dev
+
+      - name: Configure (macOS, universal)
+        if: runner.os == 'macOS'
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+                -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+
+      - name: Configure (Linux)
+        if: runner.os == 'Linux'
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        run: cmake -S . -B build -A x64
+
+      # Each format compiles the whole of JUCE; an unbounded -j runs the hosted
+      # runners out of memory (cc1plus killed), so cap the job count.
+      - name: Build
+        run: cmake --build build --config Release --parallel 2
+
+      - name: Tests
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      # ---------- macOS: guided .pkg installer with the EULA pane ----------
+      - name: Package .pkg installer (macOS)
+        if: runner.os == 'macOS'
+        env:
+          APPLE_DEVELOPER_ID: ${{ secrets.APPLE_DEVELOPER_ID }}
+          APPLE_INSTALLER_ID: ${{ secrets.APPLE_INSTALLER_ID }}
+          PKG_OUT: HumHouse-Pitch-Shifter-macOS.pkg
+        run: |
+          mkdir -p artifacts
+          chmod +x scripts/package_macos_pkg.sh
+          ./scripts/package_macos_pkg.sh
+          mv "$PKG_OUT" artifacts/
+
+      - name: Verify macOS installer
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          pkg="artifacts/HumHouse-Pitch-Shifter-macOS.pkg"
+          pkgutil --expand "$pkg" /tmp/pkg_expanded
+          test -s /tmp/pkg_expanded/Resources/license.txt \
+            || { echo "no EULA pane in the installer"; exit 1; }
+          test -d /tmp/pkg_expanded/vst3.pkg || { echo "missing vst3.pkg"; exit 1; }
+
+          # Stand in for a previous version, then install twice: the second run
+          # is the upgrade path a user actually hits.
+          sudo mkdir -p "/Library/Audio/Plug-Ins/VST3/HumHouse Pitch Shifter.vst3/stale"
+          echo old | sudo tee "/Library/Audio/Plug-Ins/VST3/HumHouse Pitch Shifter.vst3/stale/old.txt" >/dev/null
+          sudo installer -pkg "$pkg" -target /
+          sudo installer -pkg "$pkg" -target /
+          if [ -e "/Library/Audio/Plug-Ins/VST3/HumHouse Pitch Shifter.vst3/stale/old.txt" ]; then
+            echo "upgrade left the old plug-in behind"; exit 1
+          fi
+          for p in "/Library/Audio/Plug-Ins/VST3/HumHouse Pitch Shifter.vst3" \
+                   "/Library/Audio/Plug-Ins/Components/HumHouse Pitch Shifter.component"; do
+            test -e "$p" || { echo "installer did not create $p"; exit 1; }
+            echo "installed: $p"
+          done
+
+      # ---------- Windows: .exe installer via Inno Setup ----------
+      - name: Package Windows installer (Inno Setup)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          # Inno Setup 6 ships preinstalled on windows-2022 GitHub runners.
+          $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+          }
+          & $iscc installer/windows/HumHousePitchShifter.iss
+          Copy-Item HumHouse-Pitch-Shifter-Windows-Setup.exe artifacts/
+
+          # Also ship the raw VST3 + Standalone .exe for manual or portable use.
+          Copy-Item -Recurse "build/HumHousePitch_artefacts/Release/VST3/HumHouse Pitch Shifter.vst3" artifacts/
+          Copy-Item "build/HumHousePitch_artefacts/Release/Standalone/HumHouse Pitch Shifter.exe" artifacts/
+          @'
+          HumHouse Pitch Shifter - Windows
+          ================================
+
+          RECOMMENDED: run HumHouse-Pitch-Shifter-Windows-Setup.exe. It shows the
+          licence, then installs the VST3 into
+          C:\Program Files\Common Files\VST3\ and the Standalone into Program
+          Files. Afterwards, rescan plug-ins in your DAW.
+
+          MANUAL INSTALL (alternative):
+          A) Standalone app (no plug-in scanning needed):
+             Double-click "HumHouse Pitch Shifter.exe".
+          B) VST3 plug-in:
+             Copy the whole "HumHouse Pitch Shifter.vst3" folder into
+                 C:\Program Files\Common Files\VST3\
+          '@ | Out-File -FilePath artifacts/README.txt -Encoding ASCII
+
+      - name: Verify Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $exe = 'artifacts/HumHouse-Pitch-Shifter-Windows-Setup.exe'
+          $len = (Get-Item $exe).Length
+          if ($len -lt 1MB) { throw "installer is only $len bytes" }
+
+          # Stand in for a previous version: a stale file inside the VST3 bundle
+          # that the new setup has to sweep away rather than leave behind.
+          $staleVst3 = "$env:CommonProgramFiles\VST3\HumHouse Pitch Shifter.vst3\Contents\stale.txt"
+          New-Item -ItemType Directory -Force -Path (Split-Path $staleVst3) | Out-Null
+          Set-Content -LiteralPath $staleVst3 -Value 'old'
+
+          Start-Process -Wait -FilePath $exe `
+            -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART'
+          # Installing again must succeed as an in-place upgrade, not a second copy.
+          Start-Process -Wait -FilePath $exe `
+            -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART'
+
+          if (Test-Path -LiteralPath $staleVst3) { throw "upgrade left the old version behind: $staleVst3" }
+          $expected = @(
+            "$env:CommonProgramFiles\VST3\HumHouse Pitch Shifter.vst3",
+            "$env:ProgramFiles\HumHouse\HumHouse Pitch Shifter\HumHouse Pitch Shifter.exe",
+            "$env:ProgramFiles\HumHouse\HumHouse Pitch Shifter\LICENSE.txt"
+          )
+          foreach ($p in $expected) {
+            if (-not (Test-Path -LiteralPath $p)) { throw "installer did not create $p" }
+            Write-Host "installed: $p"
+          }
+
+      # ---------- Linux: VST3 bundle + Standalone binary ----------
+      - name: Stage artifacts (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p artifacts
+          cp -R "build/HumHousePitch_artefacts/Release/VST3/HumHouse Pitch Shifter.vst3" artifacts/
+          cp    "build/HumHousePitch_artefacts/Release/Standalone/HumHouse Pitch Shifter" artifacts/ || true
+          cp installer/LICENSE.txt artifacts/
+          cat > artifacts/README.txt <<'EOF'
+          HumHouse Pitch Shifter - Linux
+
+          Standalone: chmod +x "HumHouse Pitch Shifter" && ./"HumHouse Pitch Shifter"
+          VST3:       copy the "HumHouse Pitch Shifter.vst3" folder into ~/.vst3/
+          EOF
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: artifacts/
+          if-no-files-found: error
+
+      # ---------- Release assets (tagged releases only) ----------
+      - name: Stage release assets (Windows)
+        if: github.event_name == 'release' && runner.os == 'Windows'
+        shell: bash
+        run: |
+          cp artifacts/HumHouse-Pitch-Shifter-Windows-Setup.exe .
+          mkdir -p _portable
+          cp -R "artifacts/HumHouse Pitch Shifter.vst3" _portable/
+          cp "artifacts/HumHouse Pitch Shifter.exe" _portable/
+          cp artifacts/README.txt _portable/
+          cd _portable && 7z a -tzip "../${{ matrix.artifact }}.zip" .
+
+      - name: Stage release assets (Linux)
+        if: github.event_name == 'release' && runner.os == 'Linux'
+        shell: bash
+        run: |
+          cd artifacts
+          zip -r "../${{ matrix.artifact }}.zip" .
+
+      - name: Stage release assets (macOS)
+        if: github.event_name == 'release' && runner.os == 'macOS'
+        run: cp "artifacts/HumHouse-Pitch-Shifter-macOS.pkg" .
+
+      - name: Upload release asset
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ runner.os == 'macOS'   && 'HumHouse-Pitch-Shifter-macOS.pkg'         || '' }}
+            ${{ runner.os == 'Windows' && 'HumHouse-Pitch-Shifter-Windows-Setup.exe' || '' }}
+            ${{ runner.os == 'Windows' && format('{0}.zip', matrix.artifact)         || '' }}
+            ${{ runner.os == 'Linux'   && format('{0}.zip', matrix.artifact)         || '' }}
