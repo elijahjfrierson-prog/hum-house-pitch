@@ -1,0 +1,9 @@
+build/
+cmake-build*/
+artifacts/
+*.pkg
+*.dmg
+*.exe
+.DS_Store
+.vscode/
+.idea/
