@@ -12,6 +12,7 @@
 namespace
 {
 constexpr double kFs = 48000.0;
+constexpr double kPi = 3.14159265358979323846;   // MSVC has no M_PI
 int failures = 0;
 
 void check(bool ok, const std::string& what, const std::string& detail = {})
@@ -36,7 +37,7 @@ std::vector<float> sine(double freq, int numSamples, double amplitude = 0.5)
     std::vector<float> out(static_cast<size_t>(numSamples));
     for (int i = 0; i < numSamples; ++i)
         out[static_cast<size_t>(i)] =
-            static_cast<float>(amplitude * std::sin(2.0 * M_PI * freq * i / kFs));
+            static_cast<float>(amplitude * std::sin(2.0 * kPi * freq * i / kFs));
     return out;
 }
 
@@ -60,14 +61,14 @@ double estimateFrequency(const std::vector<float>& x, int from, int length)
     std::vector<double> windowed(static_cast<size_t>(length));
     for (int i = 0; i < length; ++i)
     {
-        const double w = 0.5 - 0.5 * std::cos(2.0 * M_PI * i / (length - 1));
+        const double w = 0.5 - 0.5 * std::cos(2.0 * kPi * i / (length - 1));
         windowed[static_cast<size_t>(i)] = w * x[static_cast<size_t>(from + i)];
     }
 
     const auto magnitude = [&](double freq)
     {
         double re = 0.0, im = 0.0;
-        const double step = 2.0 * M_PI * freq / kFs;
+        const double step = 2.0 * kPi * freq / kFs;
         for (int i = 0; i < length; ++i)
         {
             re += windowed[static_cast<size_t>(i)] * std::cos(step * i);

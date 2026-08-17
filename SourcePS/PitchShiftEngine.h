@@ -50,7 +50,7 @@ public:
     void prepare(double sampleRate, double maxDelayMs);
     void reset();
 
-    void setRatio(double ratio) noexcept { targetRatio = ratio; }
+    void setRatio(double newRatio) noexcept { targetRatio = newRatio; }
     void setGrainMs(double ms) noexcept;
     void setCrossfade(double amount01) noexcept;   // 0 = short splice, 1 = full Hann
     void setPreDelayMs(double ms) noexcept;
